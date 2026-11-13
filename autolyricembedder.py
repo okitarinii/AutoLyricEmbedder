@@ -17,10 +17,12 @@ Usage:     python autolyricembedder.py [directory] [options]
 """
 
 import argparse
+import hashlib
 import json
 import os
 import random
 import re
+import shutil
 import sys
 import time
 from urllib.error import HTTPError, URLError
@@ -30,7 +32,8 @@ from urllib.request import Request, urlopen
 try:
     import mutagen
     from mutagen.asf import ASF
-    from mutagen.id3 import ID3, SYLT, USLT
+    from mutagen.id3 import ID3, SYLT, USLT, ID3NoHeaderError
+    from mutagen.mp3 import MP3
     from mutagen.mp4 import MP4
     from rich import box
     from rich.align import Align
@@ -464,13 +467,64 @@ def has_lyrics(path):
         return False
 
 
-def write_lyrics(path, lyrics, synced, write_sylt=True):
+class MetadataError(Exception):
+    """Writing lyrics would have changed other metadata; the file was left untouched."""
+
+
+def _is_lyrics_key(key):
+    key = str(key)
+    return (key.split(":")[0] in ("USLT", "SYLT") or
+            key.lower() in ("\xa9lyr", "wm/lyrics", "lyrics", "unsyncedlyrics"))
+
+
+def _open_tags(path):
+    """Returns (audio, tags, had_tags). MP3 ID3 tags are loaded with
+    translate=False so ID3v2.3 frames aren't converted or dropped in memory."""
     audio = mutagen.File(path)
     if audio is None:
         raise ValueError("unsupported file")
+    if isinstance(audio, MP3):
+        try:
+            return audio, ID3(path, translate=False), True
+        except ID3NoHeaderError:
+            return audio, ID3(), False
     if audio.tags is None:
         audio.add_tags()
-    tags = audio.tags
+        return audio, audio.tags, False
+    return audio, audio.tags, True
+
+
+def _digest(value):
+    return hashlib.sha1(repr(value).encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def tag_snapshot(path):
+    """Fingerprint of every non-lyrics tag and embedded picture in a file."""
+    audio, tags, had = _open_tags(path)
+    snap = {}
+    if not had:
+        return snap, None
+    version = None
+    if isinstance(tags, ID3):
+        version = tags.version
+        for frame in tags.values():
+            if not _is_lyrics_key(frame.FrameID):
+                snap[frame.HashKey] = _digest(frame)
+        for i, raw in enumerate(getattr(tags, "unknown_frames", None) or []):
+            snap["unknown#{}".format(i)] = hashlib.sha1(raw).hexdigest()
+    else:
+        grouped = {}
+        for key, value in tags.items():
+            if not _is_lyrics_key(key):
+                grouped.setdefault(str(key).lower(), []).append(_digest(value))
+        snap.update({k: sorted(v) for k, v in grouped.items()})
+    for i, pic in enumerate(getattr(audio, "pictures", None) or []):  # FLAC picture blocks
+        snap["picture#{}".format(i)] = hashlib.sha1(pic.data).hexdigest() + str(pic.type)
+    return snap, version
+
+
+def _apply_lyrics(path, lyrics, synced, write_sylt):
+    audio, tags, had = _open_tags(path)
 
     if isinstance(tags, ID3):  # MP3, WAV, AIFF
         tags.delall("USLT")
@@ -481,7 +535,16 @@ def write_lyrics(path, lyrics, synced, write_sylt=True):
             if entries:
                 tags.add(SYLT(encoding=3, lang="XXX", format=2, type=1,
                               desc="", text=entries))
-    elif isinstance(audio, MP4):
+        # Keep the file's ID3 version: upgrading v2.3 -> v2.4 drops unknown and
+        # v2.3-only frames, and some players/car stereos can't read v2.4.
+        # New tags (and v1/v2.2, which can't be written back) use v2.3 for compatibility.
+        version = 4 if had and tags.version >= (2, 4, 0) else 3
+        if isinstance(audio, MP3):
+            tags.save(path, v2_version=version)  # v1=1 default: keep an existing ID3v1 tag
+        else:
+            audio.save(v2_version=version)
+        return
+    if isinstance(audio, MP4):
         tags["\xa9lyr"] = [lyrics]
     elif isinstance(audio, ASF):
         tags["WM/Lyrics"] = lyrics
@@ -491,6 +554,38 @@ def write_lyrics(path, lyrics, synced, write_sylt=True):
                 del tags[key]
         tags["LYRICS"] = lyrics
     audio.save()
+
+
+def write_lyrics(path, lyrics, synced, write_sylt=True):
+    """Embed lyrics without touching any other metadata.
+
+    The tags are written to a temporary copy first. The copy only replaces the
+    original if every other tag and picture is byte-for-byte unchanged, so a
+    failure or a lossy save can never damage the original file."""
+    before, version = tag_snapshot(path)
+    folder, name = os.path.split(path)
+    stem, ext = os.path.splitext(name)
+    tmp = os.path.join(folder, ".{}.lyrics-tmp{}".format(stem, ext))
+    try:
+        shutil.copy2(path, tmp)
+        _apply_lyrics(tmp, lyrics, synced, write_sylt)
+        after, new_version = tag_snapshot(tmp)
+        # ID3v1/v2.2 sources are necessarily converted; for those only pictures must match.
+        strict = version is None or version >= (2, 3, 0)
+        keys = before if strict else [k for k in before if k.startswith(("APIC", "picture#"))]
+        lost = sorted(k for k in keys if k not in after)
+        changed = sorted(k for k in keys if k in after and after[k] != before[k])
+        if strict and version is not None and new_version is not None and \
+                version[:2] != new_version[:2]:
+            changed.append("ID3 version {}.{} -> {}.{}".format(*(version[:2] + new_version[:2])))
+        if lost or changed:
+            details = ", ".join(["lost " + k for k in lost] + ["changed " + k for k in changed])
+            raise MetadataError("aborted, file left untouched – writing would alter other "
+                                "metadata ({})".format(details[:300]))
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 def write_lrc_file(path, lyrics):
@@ -585,7 +680,8 @@ def collect_files(directory, recursive):
     else:
         files = [os.path.join(directory, n) for n in os.listdir(directory)]
     files = [f for f in files
-             if os.path.isfile(f) and os.path.splitext(f)[1].lower() in AUDIO_EXTS]
+             if os.path.isfile(f) and os.path.splitext(f)[1].lower() in AUDIO_EXTS
+             and ".lyrics-tmp" not in os.path.basename(f)]  # leftovers of an interrupted write
     return sorted(files, key=lambda p: p.lower())
 
 

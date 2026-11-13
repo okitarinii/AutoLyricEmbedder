@@ -100,3 +100,5 @@ When confirming matches interactively: `Enter` uses the selected match, `1-8` pi
 | FLAC / OGG / Opus | `LYRICS` |
 | M4A / MP4 | `©lyr` |
 | WMA | `WM/Lyrics` |
+
+Only the lyrics are changed. Lyrics are written to a temporary copy first, and the copy replaces the original only if every other tag and embedded picture (cover art, etc.) is unchanged; otherwise the file is left untouched and reported as an error. ID3 tags keep their original version (v2.3 stays v2.3), so frames from other taggers aren't dropped.
