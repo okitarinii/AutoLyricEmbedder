@@ -11,16 +11,15 @@ up on https://lrclib.net, and writes the lyrics back into the file's metadata:
   M4A / MP4 / ALAC  ->  (c)lyr atom
   WMA               ->  WM/Lyrics
 
-Requires:  pip install mutagen
+Requires:  pip install -r requirements.txt   (mutagen, rich)
 Usage:     python autolyricembedder.py [directory] [options]
            (run with no arguments for fully interactive mode)
 """
 
-from __future__ import print_function
-
 import argparse
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -33,9 +32,19 @@ try:
     from mutagen.asf import ASF
     from mutagen.id3 import ID3, SYLT, USLT
     from mutagen.mp4 import MP4
-except ImportError:
-    print("This script needs the 'mutagen' package. Install it with:\n"
-          "    pip install mutagen")
+    from rich import box
+    from rich.align import Align
+    from rich.console import Console, Group
+    from rich.markup import escape
+    from rich.panel import Panel
+    from rich.progress import (BarColumn, MofNCompleteColumn, Progress,
+                               SpinnerColumn, TextColumn, TimeElapsedColumn)
+    from rich.prompt import Confirm, Prompt
+    from rich.table import Table
+    from rich.text import Text
+except ImportError as _e:
+    print("Missing dependency ({}). Install them with:\n"
+          "    pip install -r requirements.txt".format(_e))
     sys.exit(1)
 
 # Make sure non-ASCII titles/lyrics print on Windows consoles.
@@ -45,38 +54,82 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
+console = Console(highlight=False)
+
 API_BASE = "https://lrclib.net/api"
-USER_AGENT = "AutoLyricEmbedder/1.0 (+https://lrclib.net)"
+APP_NAME = "AutoLyricEmbedder v1.2"
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".autolyricembedder.json")
+MIN_REQUEST_GAP = 0.3  # seconds between API calls (docs recommend 200-500 ms)
+
+# Client identification (see docs/lrclibdocs.txt -> "Client identification").
+# A User-Agent naming the app gets ~90 req/min; a registered App ID ~180 req/min.
+CLIENT = {"user_agent": APP_NAME, "app_id": "", "api_key": ""}
+_last_request = [0.0]
 AUDIO_EXTS = {".mp3", ".flac", ".m4a", ".mp4", ".m4b", ".alac", ".ogg",
               ".oga", ".opus", ".wav", ".aif", ".aiff", ".wma"}
 LRC_LINE = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
+MAX_CHOICES = 8
 
 
 # --------------------------------------------------------------------------- #
-# Console helpers
+# Banner
 # --------------------------------------------------------------------------- #
-def ask(prompt, default=None):
-    suffix = " [{}]".format(default) if default not in (None, "") else ""
-    try:
-        answer = input("{}{}: ".format(prompt, suffix)).strip()
-    except EOFError:
-        answer = ""
-    return answer if answer else (default or "")
+GLYPHS = {
+    "A": [" █████╗ ", "██╔══██╗", "███████║", "██╔══██║", "██║  ██║", "╚═╝  ╚═╝"],
+    "B": ["██████╗ ", "██╔══██╗", "██████╔╝", "██╔══██╗", "██████╔╝", "╚═════╝ "],
+    "C": [" ██████╗", "██╔════╝", "██║     ", "██║     ", "╚██████╗", " ╚═════╝"],
+    "D": ["██████╗ ", "██╔══██╗", "██║  ██║", "██║  ██║", "██████╔╝", "╚═════╝ "],
+    "E": ["███████╗", "██╔════╝", "█████╗  ", "██╔══╝  ", "███████╗", "╚══════╝"],
+    "I": ["██╗", "██║", "██║", "██║", "██║", "╚═╝"],
+    "L": ["██╗     ", "██║     ", "██║     ", "██║     ", "███████╗", "╚══════╝"],
+    "M": ["███╗   ███╗", "████╗ ████║", "██╔████╔██║", "██║╚██╔╝██║",
+          "██║ ╚═╝ ██║", "╚═╝     ╚═╝"],
+    "O": [" ██████╗ ", "██╔═══██╗", "██║   ██║", "██║   ██║", "╚██████╔╝", " ╚═════╝ "],
+    "R": ["██████╗ ", "██╔══██╗", "██████╔╝", "██╔══██╗", "██║  ██║", "╚═╝  ╚═╝"],
+    "T": ["████████╗", "╚══██╔══╝", "   ██║   ", "   ██║   ", "   ██║   ", "   ╚═╝   "],
+    "U": ["██╗   ██╗", "██║   ██║", "██║   ██║", "██║   ██║", "╚██████╔╝", " ╚═════╝ "],
+    "Y": ["██╗   ██╗", "╚██╗ ██╔╝", " ╚████╔╝ ", "  ╚██╔╝  ", "   ██║   ", "   ╚═╝   "],
+}
 
 
-def ask_yes_no(prompt, default=True):
-    hint = "Y/n" if default else "y/N"
-    while True:
-        answer = ask("{} ({})".format(prompt, hint)).lower()
-        if not answer:
-            return default
-        if answer in ("y", "yes"):
-            return True
-        if answer in ("n", "no"):
-            return False
-        print("  Please answer y or n.")
+def render_word(word):
+    rows = []
+    for i in range(6):
+        width = lambda c: max(len(r) for r in GLYPHS[c])  # noqa: E731
+        rows.append("".join(GLYPHS[c][i].ljust(width(c)) for c in word))
+    return rows
 
 
+def gradient(start, end, steps):
+    s = [int(start[i:i + 2], 16) for i in (1, 3, 5)]
+    e = [int(end[i:i + 2], 16) for i in (1, 3, 5)]
+    out = []
+    for n in range(steps):
+        t = n / max(1, steps - 1)
+        out.append("#{:02x}{:02x}{:02x}".format(*[round(a + (b - a) * t) for a, b in zip(s, e)]))
+    return out
+
+
+def show_banner():
+    lines = render_word("AUTOLYRIC") + [""] + render_word("EMBEDDER")
+    if console.width >= max(len(l) for l in lines) + 4:
+        colors = gradient("#ff5f87", "#5fd7ff", len(lines))
+        art = Text()
+        for line, color in zip(lines, colors):
+            art.append(line + "\n", style="bold " + color)
+        art.rstrip()
+    else:
+        art = Text("♪ AUTOLYRICEMBEDDER ♪", style="bold magenta")
+    console.print()
+    console.print(Align.center(art))
+    console.print(Align.center(Text(
+        "synced lyrics from lrclib.net  →  straight into your audio tags", style="dim italic")))
+    console.print()
+
+
+# --------------------------------------------------------------------------- #
+# Small formatting helpers
+# --------------------------------------------------------------------------- #
 def fmt_duration(seconds):
     if not seconds:
         return "?:??"
@@ -84,28 +137,121 @@ def fmt_duration(seconds):
     return "{}:{:02d}".format(seconds // 60, seconds % 60)
 
 
+def lyric_badge(rec):
+    if rec.get("syncedLyrics"):
+        return "[green]● synced[/]"
+    if rec.get("instrumental"):
+        return "[blue]♪ instrumental[/]"
+    if rec.get("plainLyrics"):
+        return "[yellow]◐ plain[/]"
+    return "[red]✗ none[/]"
+
+
+def delta_badge(rec, meta):
+    if not (rec.get("duration") and meta["duration"]):
+        return "[dim]-[/]"
+    d = abs(rec["duration"] - meta["duration"])
+    color = "green" if d <= 2 else "yellow" if d <= 5 else "red"
+    return "[{}]{:.0f}s[/]".format(color, d)
+
+
+def track_label(meta):
+    return "[bold]{}[/] [dim]–[/] {}".format(escape(meta["artist"] or "?"), escape(meta["title"]))
+
+
 # --------------------------------------------------------------------------- #
 # LRCLIB API
 # --------------------------------------------------------------------------- #
+class AuthError(Exception):
+    """LRCLIB rejected the App ID / API key (HTTP 401)."""
+
+
+def build_user_agent(value):
+    """Accept a full User-Agent, or just a contact (email / URL) to append."""
+    value = (value or "").strip()
+    if not value:
+        return APP_NAME
+    if " " not in value and ("@" in value or value.startswith(("http://", "https://"))):
+        return "{} ({})".format(APP_NAME, value)
+    return value
+
+
+def client_headers():
+    headers = {"User-Agent": CLIENT["user_agent"] or APP_NAME}
+    if CLIENT["app_id"]:
+        headers["Lrclib-App-Id"] = CLIENT["app_id"]
+    if CLIENT["api_key"]:
+        headers["Lrclib-Api-Key"] = CLIENT["api_key"]
+    return headers
+
+
+def client_description():
+    if CLIENT["app_id"]:
+        return "[green]registered app[/] [dim](~180 req/min)[/]"
+    if CLIENT["user_agent"] != APP_NAME:
+        return "[cyan]custom User-Agent[/] [dim](~90 req/min)[/]"
+    return "[dim]default User-Agent (~90 req/min)[/]"
+
+
+def retry_after(err, attempt):
+    """Seconds to wait from the Retry-After header, plus up to 30% jitter."""
+    try:
+        delay = float(err.headers.get("Retry-After"))
+    except (TypeError, ValueError, AttributeError):
+        delay = 2.0 * (attempt + 1)
+    return max(1.0, delay) * (1 + random.uniform(0, 0.3))
+
+
 def api_request(endpoint, params):
     url = "{}/{}?{}".format(API_BASE, endpoint, urlencode(params))
-    req = Request(url, headers={"User-Agent": USER_AGENT})
-    for attempt in range(3):
+    req = Request(url, headers=client_headers())
+    for attempt in range(5):
+        # Send requests sequentially with a short gap, as the docs ask.
+        wait = MIN_REQUEST_GAP - (time.time() - _last_request[0])
+        if wait > 0:
+            time.sleep(wait)
+        _last_request[0] = time.time()
         try:
             with urlopen(req, timeout=20) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except HTTPError as e:
             if e.code == 404:
                 return None
-            if e.code == 429 or e.code >= 500:
-                time.sleep(2 * (attempt + 1))
+            if e.code == 401:
+                raise AuthError("LRCLIB rejected the App ID / API key (401). "
+                                "Check them, or run with --reset-client.")
+            if e.code in (429, 503) or e.code >= 500:
+                delay = retry_after(e, attempt)
+                if e.code == 429:
+                    console.print("  [yellow]⏳ Rate limited by LRCLIB – waiting {:.0f}s…[/]"
+                                  .format(delay))
+                time.sleep(delay)
                 continue
             raise
         except URLError:
-            if attempt == 2:
+            if attempt >= 2:
                 raise
             time.sleep(2 * (attempt + 1))
-    return None
+    raise RuntimeError("LRCLIB kept refusing requests – try again later")
+
+
+def load_client_config():
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return {k: str(data.get(k) or "") for k in ("user_agent", "app_id", "api_key")}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_client_config():
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump({k: v for k, v in CLIENT.items() if v and k != "api_key" and not (k == "user_agent" and v == APP_NAME)},
+                  f, indent=2)
+    try:
+        os.chmod(CONFIG_PATH, 0o600)
+    except OSError:
+        pass
 
 
 def clean_title(title):
@@ -291,7 +437,7 @@ def write_lrc_file(path, lyrics):
 
 
 # --------------------------------------------------------------------------- #
-# Main flow
+# Scanning
 # --------------------------------------------------------------------------- #
 def collect_files(directory, recursive):
     files = []
@@ -305,59 +451,340 @@ def collect_files(directory, recursive):
     return sorted(files, key=lambda p: p.lower())
 
 
-def describe(rec):
-    kind = ("synced" if rec.get("syncedLyrics")
-            else "instrumental" if rec.get("instrumental")
-            else "plain only" if rec.get("plainLyrics") else "no lyrics")
-    return "{} - {} [{}] ({}) <{}>".format(
-        rec.get("artistName", "?"), rec.get("trackName", "?"),
-        rec.get("albumName") or "-", fmt_duration(rec.get("duration")), kind)
+def scan(files):
+    """Read tags for every file up front. Returns a list of dicts."""
+    items = []
+    with console.status("[cyan]Reading tags…", spinner="dots"):
+        for path in files:
+            item = {"path": path, "meta": None, "has_lyrics": False, "error": None}
+            try:
+                item["meta"] = read_metadata(path)
+                if item["meta"] is None:
+                    item["error"] = "unsupported or unreadable"
+                else:
+                    item["has_lyrics"] = has_lyrics(path)
+            except Exception as e:
+                item["error"] = str(e)
+            items.append(item)
+    return items
 
 
-def preview(rec, lines=8):
+def show_library(items, directory, limit=25):
+    console.print("[bold]{}[/] audio file(s) in [cyan]{}[/]".format(len(items), escape(directory)))
+    table = Table(box=box.SIMPLE_HEAVY, header_style="bold cyan", expand=False)
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("Artist", overflow="ellipsis", max_width=24)
+    table.add_column("Title", overflow="ellipsis", max_width=34)
+    table.add_column("Album", overflow="ellipsis", max_width=24, style="dim")
+    table.add_column("Length", justify="right")
+    table.add_column("Lyrics", justify="center")
+    for n, item in enumerate(items[:limit], 1):
+        meta = item["meta"]
+        if item["error"]:
+            table.add_row(str(n), "[red]error[/]",
+                          escape(os.path.basename(item["path"])), "", "", "[red]✗[/]")
+            continue
+        table.add_row(str(n), escape(meta["artist"] or "?"), escape(meta["title"]),
+                      escape(meta["album"] or "-"), fmt_duration(meta["duration"]),
+                      "[green]✔[/]" if item["has_lyrics"] else "[dim]·[/]")
+    if len(items) > limit:
+        table.add_row("", "[dim]… and {} more[/]".format(len(items) - limit), "", "", "", "")
+    console.print(table)
+
+
+# --------------------------------------------------------------------------- #
+# Interactive pieces
+# --------------------------------------------------------------------------- #
+def matches_table(candidates, meta, selected):
+    table = Table(box=box.ROUNDED, header_style="bold magenta", show_lines=False)
+    table.add_column("", width=1)
+    table.add_column("#", justify="right")
+    table.add_column("Artist", overflow="ellipsis", max_width=22)
+    table.add_column("Title", overflow="ellipsis", max_width=30)
+    table.add_column("Album", overflow="ellipsis", max_width=24, style="dim")
+    table.add_column("Length", justify="right")
+    table.add_column("Δ", justify="right")
+    table.add_column("Lyrics")
+    for i, c in enumerate(candidates[:MAX_CHOICES]):
+        sel = i == selected
+        table.add_row("[bold cyan]▶[/]" if sel else "", str(i + 1),
+                      escape(c.get("artistName") or "?"), escape(c.get("trackName") or "?"),
+                      escape(c.get("albumName") or "-"), fmt_duration(c.get("duration")),
+                      delta_badge(c, meta), lyric_badge(c),
+                      style="bold" if sel else None)
+    return table
+
+
+def show_preview(rec, lines=12):
     text = rec.get("syncedLyrics") or rec.get("plainLyrics") or ""
-    body = [l for l in text.splitlines() if l.strip()][:lines]
-    print("    " + "\n    ".join(body) if body else "    (empty)")
-    if len(text.splitlines()) > lines:
-        print("    ...")
+    body = [l for l in text.splitlines() if l.strip()]
+    out = Text()
+    for line in body[:lines]:
+        m = re.match(r"^((?:\[\d+:\d+(?:\.\d+)?\])+)\s*(.*)$", line)
+        if m:
+            out.append(m.group(1) + " ", style="cyan dim")
+            out.append(m.group(2) + "\n")
+        else:
+            out.append(line + "\n")
+    if len(body) > lines:
+        out.append("… {} more lines".format(len(body) - lines), style="dim italic")
+    out.rstrip()
+    console.print(Panel(out if body else Text("(empty)", style="dim"),
+                        title="[bold]{} – {}[/]".format(escape(rec.get("artistName") or "?"),
+                                                        escape(rec.get("trackName") or "?")),
+                        title_align="left", border_style="cyan", box=box.ROUNDED,
+                        padding=(0, 2), expand=False))
+
+
+KEYS_HELP = ("[bold cyan]Enter[/] use ▶   [bold cyan]1-{}[/] select   "
+             "[bold cyan]p[/] preview   [bold cyan]s[/] search   [bold cyan]n[/] skip   "
+             "[bold cyan]a[/] auto rest   [bold cyan]q[/] quit").format(MAX_CHOICES)
 
 
 def choose_interactively(candidates, meta):
-    """Let the user pick a candidate. Returns a record, None (skip) or 'quit'."""
-    idx = 0
+    """Let the user pick a candidate. Returns a record, None (skip), 'auto' or 'quit'."""
+    selected = 0
+    redraw = True
     while True:
-        if candidates:
-            print("  Matches:")
-            for i, c in enumerate(candidates[:8], 1):
-                marker = "*" if i - 1 == idx else " "
-                print("   {}{}. {}".format(marker, i, describe(c)))
-        else:
-            print("  No matches found.")
-        choice = ask("  [Enter]=use *, 1-8=pick, p=preview, s=search, n=skip, "
-                     "a=auto for rest, q=quit").lower()
+        if redraw:
+            if candidates:
+                console.print(matches_table(candidates, meta, selected))
+            else:
+                console.print("  [yellow]No matches found on LRCLIB.[/] "
+                              "Press [bold cyan]s[/] to search with your own query.")
+            console.print("  " + KEYS_HELP, style="dim")
+        redraw = False
+        try:
+            choice = console.input("  [bold magenta]›[/] ").strip().lower()
+        except EOFError:
+            return "quit"
+
         if choice == "" and candidates:
-            return candidates[idx]
-        if choice.isdigit() and 1 <= int(choice) <= min(8, len(candidates)):
-            idx = int(choice) - 1
-            preview(candidates[idx])
-            continue
-        if choice == "p" and candidates:
-            preview(candidates[idx])
+            return candidates[selected]
+        if choice.isdigit() and 1 <= int(choice) <= min(MAX_CHOICES, len(candidates)):
+            selected = int(choice) - 1
+            show_preview(candidates[selected])
+            redraw = True
+        elif choice == "p" and candidates:
+            show_preview(candidates[selected])
         elif choice == "s":
             default_q = "{} {}".format(meta["artist"], meta["title"]).strip()
-            query = ask("  Search query", default_q)
+            query = Prompt.ask("  [bold]Search LRCLIB for[/]", default=default_q, console=console)
             try:
-                candidates = manual_search(query)
+                with console.status("[cyan]Searching…", spinner="dots"):
+                    candidates = manual_search(query)
+            except AuthError:
+                raise
             except Exception as e:
-                print("  Search failed: {}".format(e))
+                console.print("  [red]Search failed:[/] {}".format(escape(str(e))))
             candidates.sort(key=lambda c: score_result(c, meta))
-            idx = 0
+            selected = 0
+            redraw = True
         elif choice == "n":
             return None
         elif choice == "a":
             return "auto"
         elif choice == "q":
             return "quit"
+        else:
+            console.print("  [dim]Unknown key – try one of the options above.[/]")
+
+
+def setup(args, script_dir):
+    """Interactive first-run questions. Returns the target directory."""
+    console.print(Panel(
+        "Answer a few questions, or just press [bold cyan]Enter[/] to accept the defaults.\n"
+        "[dim]Tip: run with [bold]--help[/bold] to see command-line options.[/]",
+        title="[bold]Setup[/]", title_align="left", border_style="magenta",
+        box=box.ROUNDED, expand=False))
+    while True:
+        directory = Prompt.ask("[bold]Music folder[/]", default=script_dir, console=console)
+        directory = os.path.abspath(os.path.expanduser(directory.strip().strip('"')))
+        if os.path.isdir(directory):
+            break
+        console.print("  [red]✖ Not a folder:[/] {}".format(escape(directory)))
+    args.recursive = Confirm.ask("Include subfolders?", default=args.recursive, console=console)
+    args.overwrite = Confirm.ask("Overwrite lyrics that are already embedded?",
+                                 default=args.overwrite, console=console)
+    args.plain = Confirm.ask("Use plain (untimed) lyrics if no synced version exists?",
+                             default=True, console=console)
+    args.lrc = Confirm.ask("Also save .lrc files next to the audio?",
+                           default=args.lrc, console=console)
+    args.auto = not Confirm.ask("Review each match before writing?", default=True, console=console)
+    setup_client()
+    return directory
+
+
+def setup_client():
+    """Optional: identify this client to LRCLIB for higher rate limits."""
+    configured = bool(CLIENT["app_id"] or CLIENT["user_agent"] != APP_NAME)
+    question = ("Change your saved LRCLIB identification?" if configured else
+                "Set up LRCLIB identification for higher rate limits? [dim](optional)[/]")
+    if configured:
+        console.print("  [dim]LRCLIB client:[/] " + client_description())
+    if not Confirm.ask(question, default=False, console=console):
+        return
+    console.print(Panel(
+        "LRCLIB limits requests per client:\n"
+        "  [dim]•[/] generic / anonymous client      [dim]~45 req/min[/]\n"
+        "  [dim]•[/] [cyan]User-Agent[/] naming the app      [dim]~90 req/min[/]\n"
+        "  [dim]•[/] registered [cyan]App ID[/]              [dim]~180 req/min[/]\n\n"
+        "Get a free App ID (client-side app) at [link=https://lrclib.net/developers]"
+        "[bold]https://lrclib.net/developers[/][/link].\n"
+        "[dim]For the User-Agent you can type a full string, or just an email / URL "
+        "to add as contact info.[/]",
+        title="[bold]LRCLIB client identification[/]", title_align="left",
+        border_style="cyan", box=box.ROUNDED, expand=False))
+    CLIENT["user_agent"] = build_user_agent(Prompt.ask(
+        "[bold]User-Agent or contact[/]", default=CLIENT["user_agent"], console=console))
+    app_id = Prompt.ask("[bold]App ID[/] [dim](blank for none)[/]",
+                        default=CLIENT["app_id"] or "", show_default=bool(CLIENT["app_id"]),
+                        console=console).strip()
+    CLIENT["app_id"] = "" if app_id.lower() in ("-", "none") else app_id
+    console.print("  [dim]Using:[/] {}  [dim]→[/] {}".format(
+        escape(CLIENT["user_agent"]), client_description()))
+    if Confirm.ask("Save this for next time?", default=True, console=console):
+        try:
+            save_client_config()
+            console.print("  [green]✔ Saved to[/] {}".format(escape(CONFIG_PATH)))
+        except OSError as e:
+            console.print("  [red]✖ Could not save:[/] {}".format(escape(str(e))))
+
+
+def show_settings(args):
+    def flag(v):
+        return "[green]✔ yes[/]" if v else "[dim]✗ no[/]"
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="bold")
+    grid.add_column()
+    grid.add_row("Mode", "[cyan]automatic[/]" if args.auto else "[magenta]review each match[/]")
+    grid.add_row("Subfolders", flag(args.recursive))
+    grid.add_row("Overwrite existing", flag(args.overwrite))
+    grid.add_row("Plain-lyrics fallback", flag(args.plain))
+    grid.add_row(".lrc sidecar files", flag(args.lrc))
+    grid.add_row("ID3 SYLT frame", flag(not args.no_sylt))
+    grid.add_row("LRCLIB client", client_description())
+    if args.dry_run:
+        grid.add_row("Dry run", "[yellow]✔ nothing will be written[/]")
+    console.print(Panel(grid, title="[bold]Settings[/]", title_align="left",
+                        border_style="blue", box=box.ROUNDED, expand=False))
+
+
+# --------------------------------------------------------------------------- #
+# Processing
+# --------------------------------------------------------------------------- #
+def apply_record(item, rec, args):
+    """Write rec's lyrics into the file. Returns (status, message)."""
+    if rec.get("instrumental"):
+        return "skipped", "[blue]♪ instrumental on LRCLIB – skipped[/]"
+    lyrics, synced = rec.get("syncedLyrics"), True
+    if not lyrics:
+        if args.plain and rec.get("plainLyrics"):
+            lyrics, synced = rec["plainLyrics"], False
+        else:
+            return "not_found", "[yellow]◐ only plain lyrics available – skipped[/]"
+    kind = "synced" if synced else "plain"
+    if args.dry_run:
+        return kind, "[yellow]○ would embed {} lyrics (dry run)[/]".format(kind)
+    try:
+        write_lyrics(item["path"], lyrics, synced, write_sylt=not args.no_sylt)
+        if args.lrc:
+            write_lrc_file(item["path"], lyrics)
+    except Exception as e:
+        return "errors", "[red]✖ write failed: {}[/]".format(escape(str(e)))
+    return kind, "[green]✔ embedded {} lyrics{}[/]".format(kind, " + .lrc" if args.lrc else "")
+
+
+def precheck(item, args):
+    """Returns (status, message) if the file should not be looked up, else None."""
+    if item["error"]:
+        return "errors", "[red]✖ {}[/]".format(escape(item["error"]))
+    if item["has_lyrics"] and not args.overwrite:
+        return "skipped", "[dim]⏭ already has lyrics[/]"
+    return None
+
+
+def process_interactive(item, n, total, args):
+    """Returns (status, message, control) where control is None/'auto'/'quit'."""
+    meta = item["meta"]
+    console.print()
+    console.rule("[bold magenta]Track {}/{}[/]".format(n, total), style="magenta", align="left")
+    console.print("  [dim]File[/]  {}".format(escape(os.path.basename(item["path"]))))
+    if meta:
+        console.print("  [dim]Tags[/]  {}  [dim]· {} · {}[/]".format(
+            track_label(meta), escape(meta["album"] or "no album"), fmt_duration(meta["duration"])))
+    early = precheck(item, args)
+    if early:
+        return early + (None,)
+
+    try:
+        with console.status("[cyan]Searching LRCLIB…", spinner="dots"):
+            candidates = find_lyrics(meta)
+    except AuthError:
+        raise
+    except Exception as e:
+        return "errors", "[red]✖ LRCLIB request failed: {}[/]".format(escape(str(e))), None
+
+    rec = choose_interactively(candidates, meta)
+    if rec == "quit":
+        return None, None, "quit"
+    control = None
+    if rec == "auto":
+        control = "auto"
+        rec = candidates[0] if candidates else None
+    if not rec:
+        return ("not_found" if not candidates else "skipped"), "[dim]⏭ no lyrics applied[/]", control
+    return apply_record(item, rec, args) + (control,)
+
+
+def process_auto(item, args):
+    early = precheck(item, args)
+    if early:
+        return early
+    try:
+        candidates = find_lyrics(item["meta"])
+    except AuthError:
+        raise
+    except Exception as e:
+        return "errors", "[red]✖ LRCLIB request failed: {}[/]".format(escape(str(e)))
+    if not candidates:
+        return "not_found", "[yellow]✗ not found on LRCLIB[/]"
+    return apply_record(item, candidates[0], args)
+
+
+def run_auto(items, start, args, stats):
+    total = len(items)
+    with Progress(SpinnerColumn("dots", style="magenta"),
+                  TextColumn("[progress.description]{task.description}"),
+                  BarColumn(bar_width=None, complete_style="magenta", finished_style="green"),
+                  MofNCompleteColumn(), TimeElapsedColumn(),
+                  console=console, transient=True) as progress:
+        task = progress.add_task("", total=total - start)
+        for n in range(start, total):
+            item = items[n]
+            name = item["meta"]["title"] if item["meta"] else os.path.basename(item["path"])
+            progress.update(task, description="[cyan]{}[/]".format(escape(name[:40])))
+            status, message = process_auto(item, args)
+            stats[status] += 1
+            label = track_label(item["meta"]) if item["meta"] else escape(os.path.basename(item["path"]))
+            progress.console.print("  [dim]{:>{w}}/{}[/]  {}  {}".format(
+                n + 1, total, label, message, w=len(str(total))))
+            progress.advance(task)
+
+
+def show_summary(stats, elapsed):
+    table = Table.grid(padding=(0, 3))
+    table.add_column(style="bold")
+    table.add_column(justify="right")
+    table.add_row("[green]● Synced lyrics[/]", str(stats["synced"]))
+    table.add_row("[yellow]◐ Plain lyrics[/]", str(stats["plain"]))
+    table.add_row("[dim]⏭ Skipped[/]", str(stats["skipped"]))
+    table.add_row("[yellow]✗ Not found[/]", str(stats["not_found"]))
+    table.add_row("[red]✖ Errors[/]", str(stats["errors"]))
+    console.print()
+    console.print(Panel(table, title="[bold]Done[/] [dim]in {:.1f}s[/]".format(elapsed),
+                        title_align="left", border_style="green", box=box.ROUNDED,
+                        padding=(0, 2), expand=False))
 
 
 def main():
@@ -365,7 +792,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Fetch timestamped lyrics from LRCLIB and embed them in audio files.")
     parser.add_argument("directory", nargs="?", help="folder with audio files "
-                        "(default: prompt, suggesting the script's folder)")
+                        "(default: ask, suggesting the script's folder)")
     parser.add_argument("-r", "--recursive", action="store_true", help="include subfolders")
     parser.add_argument("-o", "--overwrite", action="store_true",
                         help="replace lyrics that are already embedded")
@@ -377,120 +804,97 @@ def main():
     parser.add_argument("--no-sylt", action="store_true",
                         help="MP3/WAV/AIFF: don't write the ID3 SYLT frame")
     parser.add_argument("--dry-run", action="store_true", help="show what would happen, write nothing")
+    ident = parser.add_argument_group(
+        "LRCLIB client identification (optional, raises rate limits; "
+        "also read from LRCLIB_USER_AGENT / LRCLIB_APP_ID / LRCLIB_API_KEY)")
+    ident.add_argument("--user-agent", metavar="UA",
+                       help="custom User-Agent, or just an email/URL to add as contact")
+    ident.add_argument("--app-id", help="registered Lrclib-App-Id from lrclib.net/developers")
+    ident.add_argument("--api-key", help="Lrclib-Api-Key (server-side apps only; never saved)")
+    ident.add_argument("--save-client", action="store_true",
+                       help="save --user-agent/--app-id to " + CONFIG_PATH)
+    ident.add_argument("--reset-client", action="store_true",
+                       help="forget saved identification and use the defaults")
     args = parser.parse_args()
 
-    print("=" * 60)
-    print(" AutoLyricEmbedder  -  synced lyrics from lrclib.net")
-    print("=" * 60)
+    # Precedence: command line > environment > saved config > default.
+    if args.reset_client and os.path.exists(CONFIG_PATH):
+        os.remove(CONFIG_PATH)
+    saved = {} if args.reset_client else load_client_config()
+    env = os.environ.get
+    CLIENT["user_agent"] = build_user_agent(
+        args.user_agent or env("LRCLIB_USER_AGENT") or saved.get("user_agent"))
+    CLIENT["app_id"] = (args.app_id or env("LRCLIB_APP_ID") or saved.get("app_id") or "").strip()
+    CLIENT["api_key"] = (args.api_key or env("LRCLIB_API_KEY") or "").strip()
+    if args.save_client:
+        save_client_config()
 
-    interactive_setup = args.directory is None
-    directory = args.directory or ask("Folder with audio files", script_dir)
-    directory = os.path.abspath(os.path.expanduser(directory.strip('"')))
-    if not os.path.isdir(directory):
-        print("Not a folder: {}".format(directory))
-        return 1
+    show_banner()
 
-    if interactive_setup:
-        args.recursive = ask_yes_no("Include subfolders?", args.recursive)
-        args.overwrite = ask_yes_no("Overwrite lyrics that are already embedded?", args.overwrite)
-        args.plain = ask_yes_no("Use plain (untimed) lyrics when no synced version exists?", True)
-        args.lrc = ask_yes_no("Also save .lrc files next to the audio?", args.lrc)
-        args.auto = not ask_yes_no("Confirm each match before writing?", True)
+    if args.directory is None:
+        directory = setup(args, script_dir)
+    else:
+        directory = os.path.abspath(os.path.expanduser(args.directory.strip('"')))
+        if not os.path.isdir(directory):
+            console.print("[red]✖ Not a folder:[/] {}".format(escape(directory)))
+            return 1
+
+    console.print()
+    show_settings(args)
 
     files = collect_files(directory, args.recursive)
     if not files:
-        print("No supported audio files found in {}".format(directory))
+        console.print("[yellow]No supported audio files found in[/] {}".format(escape(directory)))
         return 0
-    print("\nFound {} audio file(s) in {}\n".format(len(files), directory))
+    items = scan(files)
+    show_library(items, directory)
+
+    todo = sum(1 for i in items if not i["error"] and (args.overwrite or not i["has_lyrics"]))
+    if todo == 0:
+        console.print("[green]Everything already has lyrics.[/] "
+                      "Use overwrite ([bold]-o[/]) to fetch them again.")
+        return 0
+    if args.directory is None and not Confirm.ask(
+            "Look up lyrics for [bold]{}[/] file(s)?".format(todo), default=True, console=console):
+        return 0
 
     stats = {"synced": 0, "plain": 0, "skipped": 0, "not_found": 0, "errors": 0}
-    auto = args.auto
+    started = time.time()
+    n = 0
+    code = 0
+    try:
+        if not args.auto:
+            while n < len(items):
+                status, message, control = process_interactive(items[n], n + 1, len(items), args)
+                if control == "quit":
+                    console.print("  [dim]Stopped by user.[/]")
+                    break
+                stats[status] += 1
+                console.print("  " + message)
+                n += 1
+                if control == "auto":
+                    console.print("  [cyan]Switching to automatic mode for the remaining files…[/]\n")
+                    args.auto = True
+                    break
+        if args.auto and n < len(items):
+            run_auto(items, n, args, stats)
+    except AuthError as e:
+        console.print("\n[red]✖ {}[/]".format(escape(str(e))))
+        code = 1
 
-    for n, path in enumerate(files, 1):
-        rel = os.path.relpath(path, directory)
-        print("[{}/{}] {}".format(n, len(files), rel))
-        try:
-            meta = read_metadata(path)
-        except Exception as e:
-            print("  ! Could not read tags: {}".format(e))
-            stats["errors"] += 1
-            continue
-        if not meta:
-            print("  ! Unsupported or unreadable file")
-            stats["errors"] += 1
-            continue
-        print("  Tags: {} - {} [{}] ({})".format(meta["artist"] or "?", meta["title"],
-                                               meta["album"] or "-", fmt_duration(meta["duration"])))
-
-        if not args.overwrite and has_lyrics(path):
-            print("  - Already has lyrics, skipping (use overwrite to replace)")
-            stats["skipped"] += 1
-            continue
-
-        try:
-            candidates = find_lyrics(meta)
-        except Exception as e:
-            print("  ! LRCLIB request failed: {}".format(e))
-            stats["errors"] += 1
-            continue
-
-        if auto:
-            rec = candidates[0] if candidates else None
-            if rec:
-                print("  Match: {}".format(describe(rec)))
-        else:
-            rec = choose_interactively(candidates, meta)
-            if rec == "quit":
-                break
-            if rec == "auto":
-                auto = True
-                rec = candidates[0] if candidates else None
-
-        if not rec:
-            print("  - No lyrics applied")
-            stats["not_found" if not candidates else "skipped"] += 1
-            continue
-        if rec.get("instrumental"):
-            print("  - Marked instrumental on LRCLIB, skipping")
-            stats["skipped"] += 1
-            continue
-
-        lyrics, synced = rec.get("syncedLyrics"), True
-        if not lyrics:
-            if args.plain and rec.get("plainLyrics"):
-                lyrics, synced = rec["plainLyrics"], False
-            else:
-                print("  - Only plain lyrics available, skipping")
-                stats["not_found"] += 1
-                continue
-
-        if args.dry_run:
-            print("  (dry run) would embed {} lyrics".format("synced" if synced else "plain"))
-        else:
-            try:
-                write_lyrics(path, lyrics, synced, write_sylt=not args.no_sylt)
-                if args.lrc:
-                    write_lrc_file(path, lyrics)
-            except Exception as e:
-                print("  ! Failed to write: {}".format(e))
-                stats["errors"] += 1
-                continue
-            print("  + Embedded {} lyrics{}".format("synced" if synced else "plain",
-                                                   " (+ .lrc)" if args.lrc else ""))
-        stats["synced" if synced else "plain"] += 1
-        time.sleep(0.2)  # be polite to the free API
-
-    print("\nDone. Synced: {synced}  Plain: {plain}  Skipped: {skipped}  "
-          "Not found: {not_found}  Errors: {errors}".format(**stats))
-    return 0
+    show_summary(stats, time.time() - started)
+    return code
 
 
 if __name__ == "__main__":
     try:
         code = main()
     except KeyboardInterrupt:
-        print("\nCancelled.")
+        console.print("\n[dim]Cancelled.[/]")
         code = 130
     if len(sys.argv) == 1 and os.name == "nt":
-        ask("\nPress Enter to exit")  # keep the window open when double-clicked
+        try:
+            console.input("\n[dim]Press Enter to exit…[/]")  # keep window open when double-clicked
+        except (EOFError, KeyboardInterrupt):
+            pass
     sys.exit(code)
