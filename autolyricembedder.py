@@ -162,8 +162,27 @@ def track_label(meta):
 # --------------------------------------------------------------------------- #
 # LRCLIB API
 # --------------------------------------------------------------------------- #
-class AuthError(Exception):
-    """LRCLIB rejected the App ID / API key (HTTP 401)."""
+class LrclibError(Exception):
+    """An LRCLIB request failed. str() gives a one-line, user-facing summary."""
+
+    def __init__(self, status, name, message, endpoint):
+        Exception.__init__(self, status, name, message, endpoint)
+        self.status, self.name, self.message, self.endpoint = status, name, message, endpoint
+
+    def __str__(self):
+        head = "HTTP {}".format(self.status) if self.status else "Network error"
+        if self.name and self.name != "NetworkError":
+            head += " " + self.name
+        return "{}{} [/api/{}]".format(head, ": " + self.message if self.message else "",
+                                       self.endpoint)
+
+
+class AuthError(LrclibError):
+    """LRCLIB rejected the App ID / API key (HTTP 401). Aborts the whole run."""
+
+    def __str__(self):
+        return (LrclibError.__str__(self) +
+                " – check your App ID / API key, or run with --reset-client")
 
 
 def build_user_agent(value):
@@ -202,10 +221,35 @@ def retry_after(err, attempt):
     return max(1.0, delay) * (1 + random.uniform(0, 0.3))
 
 
+def http_error_details(err):
+    """(name, message) from an LRCLIB error response. Bodies are usually JSON
+    ({"name", "message", "statusCode"}) but may be plain text or HTML."""
+    name, message = "", ""
+    try:
+        body = err.read().decode("utf-8", "replace").strip()
+    except Exception:
+        body = ""
+    try:
+        data = json.loads(body)
+        if isinstance(data, dict):
+            name = str(data.get("name") or "")
+            message = str(data.get("message") or "")
+    except ValueError:
+        if body and not body.lstrip().startswith("<"):  # skip HTML error pages
+            message = " ".join(body.split())[:200]
+    return name or str(err.reason or ""), message
+
+
+def warn(message):
+    console.print("  [yellow]⚠ {}[/]".format(escape(message)))
+
+
 def api_request(endpoint, params):
     url = "{}/{}?{}".format(API_BASE, endpoint, urlencode(params))
     req = Request(url, headers=client_headers())
-    for attempt in range(5):
+    attempts = 5
+    last_error = None
+    for attempt in range(attempts):
         # Send requests sequentially with a short gap, as the docs ask.
         wait = MIN_REQUEST_GAP - (time.time() - _last_request[0])
         if wait > 0:
@@ -213,26 +257,46 @@ def api_request(endpoint, params):
         _last_request[0] = time.time()
         try:
             with urlopen(req, timeout=20) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                raw = resp.read()
+                status = resp.status
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except ValueError:
+                raise LrclibError(status, "InvalidResponse",
+                                  "response was not valid JSON", endpoint)
         except HTTPError as e:
-            if e.code == 404:
+            if e.code == 404:  # TrackNotFound: a normal "no match", not an error
                 return None
+            name, message = http_error_details(e)
+            last_error = LrclibError(e.code, name, message, endpoint)
             if e.code == 401:
-                raise AuthError("LRCLIB rejected the App ID / API key (401). "
-                                "Check them, or run with --reset-client.")
-            if e.code in (429, 503) or e.code >= 500:
+                raise AuthError(e.code, name, message, endpoint)
+            if e.code == 429 or e.code >= 500:
+                if attempt == attempts - 1:
+                    break
                 delay = retry_after(e, attempt)
-                if e.code == 429:
-                    console.print("  [yellow]⏳ Rate limited by LRCLIB – waiting {:.0f}s…[/]"
-                                  .format(delay))
+                warn("{} – retrying in {:.0f}s (attempt {}/{})".format(
+                    last_error, delay, attempt + 2, attempts))
                 time.sleep(delay)
                 continue
-            raise
-        except URLError:
+            raise last_error
+        except URLError as e:
+            last_error = LrclibError(None, "NetworkError", str(e.reason), endpoint)
             if attempt >= 2:
-                raise
-            time.sleep(2 * (attempt + 1))
-    raise RuntimeError("LRCLIB kept refusing requests – try again later")
+                break
+            delay = 2 * (attempt + 1)
+            warn("{} – retrying in {}s (attempt {}/3)".format(last_error, delay, attempt + 2))
+            time.sleep(delay)
+        except (OSError, ValueError) as e:  # timeouts, connection resets, bad chunks
+            last_error = LrclibError(None, type(e).__name__, str(e) or "connection failed", endpoint)
+            if attempt >= 2:
+                break
+            delay = 2 * (attempt + 1)
+            warn("{} – retrying in {}s (attempt {}/3)".format(last_error, delay, attempt + 2))
+            time.sleep(delay)
+    raise LrclibError(last_error.status, last_error.name,
+                      (last_error.message + " – " if last_error.message else "")
+                      + "gave up after retrying", endpoint)
 
 
 def load_client_config():
