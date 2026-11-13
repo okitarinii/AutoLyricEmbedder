@@ -14,6 +14,16 @@ pip install -r requirements.txt
 
 ## Usage
 
+Clone this repository
+
+```
+git clone https://github.com/okitarinii/AutoLyricEmbedder.git && cd autolyricembedder
+```
+or download standalone script
+```
+curl -O https://github.com/okitarinii/AutoLyricEmbedder/raw/refs/heads/main/autolyricembedder.py
+```
+
 Interactive mode (prompts for folder and options):
 
 ```
