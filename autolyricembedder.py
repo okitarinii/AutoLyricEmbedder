@@ -503,6 +503,80 @@ def write_lrc_file(path, lyrics):
 # --------------------------------------------------------------------------- #
 # Scanning
 # --------------------------------------------------------------------------- #
+def _windows_known_music_folder():
+    """Ask Windows where the Music folder is (follows OneDrive/other redirection)."""
+    try:
+        import ctypes
+        import uuid
+        from ctypes import wintypes
+
+        class GUID(ctypes.Structure):
+            _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                        ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
+
+        folder_id = GUID.from_buffer_copy(uuid.UUID("4BD8D571-6D19-48D3-BE97-422220080E43").bytes_le)
+        ptr = ctypes.c_wchar_p()
+        if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(folder_id), 0, None,
+                                                      ctypes.byref(ptr)) != 0:
+            return None
+        path = ptr.value
+        ctypes.windll.ole32.CoTaskMemFree(ptr)
+        return path
+    except Exception:
+        return None
+
+
+def _xdg_music_folder():
+    """Linux: XDG_MUSIC_DIR from ~/.config/user-dirs.dirs (may be localized)."""
+    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    try:
+        with open(os.path.join(config_home, "user-dirs.dirs"), encoding="utf-8") as f:
+            for line in f:
+                m = re.match(r'\s*XDG_MUSIC_DIR\s*=\s*"?([^"\n]*)"?', line)
+                if m:
+                    path = m.group(1).replace("$HOME", os.path.expanduser("~"))
+                    return os.path.expandvars(path)
+    except OSError:
+        pass
+    return None
+
+
+def music_folders():
+    """Default music folders that exist on this system, as [(path, label)], best first."""
+    home = os.path.expanduser("~")
+    candidates = []
+    if os.name == "nt":
+        candidates.append((_windows_known_music_folder(), "Music library"))
+        profile = os.environ.get("USERPROFILE") or home
+        candidates.append((os.path.join(profile, "Music"), "Music"))
+        for var in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
+            if os.environ.get(var):
+                candidates.append((os.path.join(os.environ[var], "Music"), "OneDrive"))
+        candidates.append((os.path.join(profile, "OneDrive", "Music"), "OneDrive"))
+    elif sys.platform == "darwin":
+        candidates.append((os.path.join(home, "Music"), "Music"))
+    else:
+        candidates.append((_xdg_music_folder(), "XDG music folder"))
+        candidates.append((os.path.join(home, "Music"), "Music"))
+
+    seen, found = set(), []
+    for path, label in candidates:
+        if not path or not os.path.isdir(path):
+            continue
+        key = os.path.normcase(os.path.realpath(path))
+        if key not in seen:
+            seen.add(key)
+            found.append((os.path.abspath(path), label))
+    return found
+
+
+def pretty_path(path):
+    home = os.path.expanduser("~")
+    if os.path.normcase(path).startswith(os.path.normcase(home + os.sep)):
+        return "~" + path[len(home):]
+    return path
+
+
 def collect_files(directory, recursive):
     files = []
     if recursive:
@@ -654,6 +728,35 @@ def choose_interactively(candidates, meta):
             console.print("  [dim]Unknown key – try one of the options above.[/]")
 
 
+def choose_folder(script_dir):
+    """Menu of default music folders + the script's folder + 'other'."""
+    options = list(music_folders())
+    if not any(os.path.normcase(p) == os.path.normcase(script_dir) for p, _ in options):
+        options.append((script_dir, "this script's folder"))
+
+    table = Table.grid(padding=(0, 2))
+    table.add_column(justify="right", style="bold cyan")
+    table.add_column()
+    table.add_column(style="dim")
+    for n, (path, label) in enumerate(options, 1):
+        table.add_row(str(n), escape(pretty_path(path)), label)
+    table.add_row(str(len(options) + 1), "Other folder…", "type a path")
+    console.print("[bold]Where are your music files?[/]")
+    console.print(table)
+
+    choices = [str(n) for n in range(1, len(options) + 2)]
+    pick = int(Prompt.ask("[bold]Folder[/]", choices=choices, default="1",
+                          show_choices=False, console=console))
+    if pick <= len(options):
+        return options[pick - 1][0]
+    while True:
+        directory = Prompt.ask("[bold]Folder path[/]", console=console)
+        directory = os.path.abspath(os.path.expanduser(directory.strip().strip('"')))
+        if os.path.isdir(directory):
+            return directory
+        console.print("  [red]✖ Not a folder:[/] {}".format(escape(directory)))
+
+
 def setup(args, script_dir):
     """Interactive first-run questions. Returns the target directory."""
     console.print(Panel(
@@ -661,13 +764,11 @@ def setup(args, script_dir):
         "[dim]Tip: run with [bold]--help[/bold] to see command-line options.[/]",
         title="[bold]Setup[/]", title_align="left", border_style="magenta",
         box=box.ROUNDED, expand=False))
-    while True:
-        directory = Prompt.ask("[bold]Music folder[/]", default=script_dir, console=console)
-        directory = os.path.abspath(os.path.expanduser(directory.strip().strip('"')))
-        if os.path.isdir(directory):
-            break
-        console.print("  [red]✖ Not a folder:[/] {}".format(escape(directory)))
-    args.recursive = Confirm.ask("Include subfolders?", default=args.recursive, console=console)
+    directory = choose_folder(script_dir)
+    # Music libraries are usually Artist/Album/… so default to scanning subfolders there.
+    is_library = any(os.path.normcase(directory) == os.path.normcase(p) for p, _ in music_folders())
+    args.recursive = Confirm.ask("Include subfolders?", default=args.recursive or is_library,
+                                 console=console)
     args.overwrite = Confirm.ask("Overwrite lyrics that are already embedded?",
                                  default=args.overwrite, console=console)
     args.plain = Confirm.ask("Use plain (untimed) lyrics if no synced version exists?",
@@ -856,7 +957,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="Fetch timestamped lyrics from LRCLIB and embed them in audio files.")
     parser.add_argument("directory", nargs="?", help="folder with audio files "
-                        "(default: ask, suggesting the script's folder)")
+                        "(default: ask, offering your Music folder)")
+    parser.add_argument("-m", "--music", action="store_true",
+                        help="use your default Music folder (Windows Music library / OneDrive, "
+                             "macOS ~/Music, Linux XDG music dir); combine with -r")
+    parser.add_argument("--list-music", action="store_true",
+                        help="print the detected Music folders and exit")
     parser.add_argument("-r", "--recursive", action="store_true", help="include subfolders")
     parser.add_argument("-o", "--overwrite", action="store_true",
                         help="replace lyrics that are already embedded")
@@ -893,10 +999,28 @@ def main():
     if args.save_client:
         save_client_config()
 
+    if args.list_music:
+        for path, label in music_folders() or [("(none found)", "")]:
+            console.print("{}  [dim]{}[/]".format(escape(path), label))
+        return 0
+    if args.music and args.directory:
+        parser.error("use either a directory or --music, not both")
+
     show_banner()
 
-    if args.directory is None:
+    interactive = args.directory is None and not args.music
+    if interactive:
         directory = setup(args, script_dir)
+    elif args.music:
+        folders = music_folders()
+        if not folders:
+            console.print("[red]✖ Couldn't find a default Music folder.[/] Pass a directory instead.")
+            return 1
+        directory = folders[0][0]
+        console.print("[bold]Music folder:[/] {}  [dim]({})[/]".format(escape(directory), folders[0][1]))
+        if len(folders) > 1:
+            console.print("[dim]Also found: {} – pass one as the directory to use it instead.[/]".format(
+                ", ".join(escape(p) for p, _ in folders[1:])))
     else:
         directory = os.path.abspath(os.path.expanduser(args.directory.strip('"')))
         if not os.path.isdir(directory):
@@ -909,6 +1033,9 @@ def main():
     files = collect_files(directory, args.recursive)
     if not files:
         console.print("[yellow]No supported audio files found in[/] {}".format(escape(directory)))
+        if not args.recursive and any(os.path.isdir(os.path.join(directory, d))
+                                      for d in os.listdir(directory)):
+            console.print("[dim]Tip: this folder has subfolders – include them with [bold]-r[/bold].[/]")
         return 0
     items = scan(files)
     show_library(items, directory)
@@ -918,7 +1045,7 @@ def main():
         console.print("[green]Everything already has lyrics.[/] "
                       "Use overwrite ([bold]-o[/]) to fetch them again.")
         return 0
-    if args.directory is None and not Confirm.ask(
+    if interactive and not Confirm.ask(
             "Look up lyrics for [bold]{}[/] file(s)?".format(todo), default=True, console=console):
         return 0
 

@@ -26,8 +26,16 @@ Non-interactive:
 python autolyricembedder.py "D:\Music" --auto --lrc
 ```
 
+Use your default Music folder (including subfolders):
+
+```
+python autolyricembedder.py --music -r --auto
+```
+
 | Option | Description |
 |---|---|
+| `-m`, `--music` | Use your default Music folder (see below) |
+| `--list-music` | Print the detected Music folders and exit |
 | `-r`, `--recursive` | Include subfolders |
 | `-o`, `--overwrite` | Replace lyrics that are already embedded |
 | `-a`, `--auto` | Use the best match without asking |
@@ -35,6 +43,16 @@ python autolyricembedder.py "D:\Music" --auto --lrc
 | `--plain` | Use untimed lyrics when no synced version exists |
 | `--no-sylt` | Don't write the ID3 `SYLT` frame (MP3/WAV/AIFF) |
 | `--dry-run` | Show what would happen without writing anything |
+
+### Default Music folder
+
+Interactive mode lists the detected Music folders to pick from; `--music` uses the first one.
+
+| OS | Folders checked |
+|---|---|
+| Windows | The Music library location reported by Windows (follows OneDrive redirection), `%USERPROFILE%\Music`, `%OneDrive%\Music`, `%USERPROFILE%\OneDrive\Music` |
+| macOS | `~/Music` |
+| Linux | `XDG_MUSIC_DIR` from `~/.config/user-dirs.dirs`, `~/Music` |
 
 ### LRCLIB client identification (optional)
 
